@@ -82,6 +82,7 @@ public class Machine
                 }
             }
             FilterType currentMax = (FilterType)GetMaxFilter(ToneFilters);
+            ResetFilter(ToneFilters);
             cv.AddBlock(currentMax, startIndex);
             startIndex += BlockSize;
 
@@ -103,11 +104,19 @@ public class Machine
                 maxType = i;
                 maxMagnitude = filter[i].NormResponse;
             }
-            filter[i] = filter[i].Reset();
         }
 
         return maxType;
     }
+
+    private void ResetFilter(Goertzel[] filter)
+    {
+        for(int i = 0; i < filter.Length; i++)
+        {
+            filter[i] = filter[i].Reset();
+        }
+    }
+
 
     public void FindVISToneStart(ushort[] samples, ref int startIndex)
     {
@@ -160,13 +169,44 @@ public class Machine
             return 1;
         }
     }
-    public (byte[], byte[], byte[]) ReadLine(SSTVParameters sstv, ushort[] samples, ref int startIndex)
+
+    public (byte[], byte[], byte[]) ReadLine(SSTVParameters sstv, ushort[] samples, ref double startIndex)
     {
         // HSYNC is handled by the line method. It will cause color processing to restart.
         // Scottie would need to consume the intial pulse first.
-        byte[] green = ReadLineGoertzel(sstv, samples, ref startIndex);
-        byte[] blue = ReadLineGoertzel(sstv, samples, ref startIndex);
-        byte[] red = ReadLineGoertzel(sstv, samples, ref startIndex);
+        //startIndex += 200;
+        byte[] blue;
+        byte[] green;
+        byte[] red;
+        bool greenSync = true;
+        bool redSync = false;
+        bool blueSync = false;
+        if(sstv.SyncAfterGreen)
+        {
+            greenSync = false;
+            blueSync = true;
+            // Also means there will be an initial 1200Hz tone on the first line of the frame.
+        }
+
+        try
+        {
+            //ConsumeHSync(sstv, samples, ref startIndex);
+            green = ReadLineGoertzel(greenSync, sstv, samples, ref startIndex);
+            blue = ReadLineGoertzel(blueSync, sstv, samples, ref startIndex);
+            red = ReadLineGoertzel(redSync, sstv, samples, ref startIndex);
+            if(!sstv.RGB)
+            {
+                ReadLineGoertzel(false, sstv, samples, ref startIndex);
+            }
+            //startIndex += (int)Math.Ceiling((sstv.SyncLengthMS * SamplesPerMS));
+
+        }
+        catch(SyncException)
+        {
+            red = new byte[sstv.PixelsPerLine];
+            blue = new byte[sstv.PixelsPerLine];
+            green = new byte[sstv.PixelsPerLine];
+        }
         return (red, green, blue);
     }
 
@@ -198,83 +238,106 @@ public class Machine
         {
             //Start, 7 data, even parity, stop
             byte viscode = ReadVIS(mySamples, ref index);
-            SSTVParameters stv = new(0, 0, 0, 0);
+            SSTVParameters stv = new(0, 0, 0, 0, 0, true);
+            //Manual choice?
+            stv= new SSTVParameters(183.040, 20, 0, 640, 480, false);
             if (viscode == 96)
             {
-                stv = new SSTVParameters(0, 0, 640, 496);
+                stv = new SSTVParameters(183.040, 20, 0, 640, 480, false);
                 Console.WriteLine("VIS indicates PD 180");
             }
             else if (viscode == 60)
             {
                 // This is Scottie S1.
-                stv = new SSTVParameters(0, 0, 256, 256);
+                stv = new SSTVParameters(0, 0, 1.5, 256, 256, true, false);
                 Console.WriteLine("VIS indicates Scottie.");
             }
             else if (viscode == 44 || viscode == 32)
             {
                 // Martin M1!
-                stv = new SSTVParameters(146.432, 4.862, 256, 256);
+                stv = new SSTVParameters(146.432, 4.862, 0.572, 256, 256, true);
                 Console.WriteLine("VIS Indicates Martin M1.");
             }
             else if (viscode == 40)
             {
-                stv = new SSTVParameters(73.216, 4.862, 160, 256);
+                stv = new SSTVParameters(73.216, 4.862, 0.572, 160, 256, true);
                 Console.WriteLine("VIS Indicates Martin M2.");
             }
             SignalFound?.Invoke(this, (stv.PixelsPerLine, stv.LinesPerFrame));
 
-            int imageStart = index;
+            // For Scottie, we need to consume the 1200hz tone at the start of the frame before we proceed.'
+            // TODO: Fix for scottie.
+
+            double lineStart = index;
             for(int i = 0; i < stv.LinesPerFrame; i++)
             {
-                int lineStart = index;
-                (byte[], byte[], byte[]) g = ReadLine(stv, mySamples, ref index);
+
+                (byte[], byte[], byte[]) g = ReadLine(stv, mySamples, ref lineStart);
+                if(!stv.RGB)
+                {
+                    ConvertYCbCrToRGB(g);
+                }
                 LineAvailable?.Invoke(this, (i, g.Item1, g.Item2, g.Item3));
             }
         }
         Console.WriteLine("Done");
     }
     
-    private byte[] ReadLineGoertzel(SSTVParameters parameters, ushort[] samples, ref int startIndex)
+    private void ConvertYCbCrToRGB((byte[] r, byte[] g, byte[] b) colors)
+    {
+        int tmp1, tmp2, tmp3;
+        for (int i = 0; i < colors.r.Length; i++)
+        {
+            tmp1 = colors.r[i];
+            tmp2 = colors.g[i];
+            tmp3 = colors.b[i];
+            tmp1 -= 16;
+            tmp2 -= 128;
+            tmp3 -= 128;
+            colors.r[i] = (byte)(1.164 * tmp1 + 0.0000 * tmp2 + 1.5960 * tmp3);
+            colors.g[i] = (byte)(1.164 * tmp1 + -0.392 * tmp2 + -0.813 * tmp3);
+            colors.b[i] = (byte)(1.164 * tmp1 + 2.0170 * tmp2 + 0.0000 * tmp3);
+        }
+    }
+
+    private byte[] ReadLineGoertzel(bool hsyncEnable, SSTVParameters parameters, ushort[] samples, ref double startIndex)
     {
         byte[] bytes = new byte[parameters.PixelsPerLine];
         int blackLevel = 1;
         int whiteLevel = 9;
         int colorStep = byte.MaxValue / 9;
         bool hsync = false;
-        do
+        int colorSampleCount = SamplesPerMS * (int)Math.Round((parameters.LineLengthMS + parameters.BlackLevelTimeMS), MidpointRounding.AwayFromZero);
+        double colorStartIndex = startIndex;
+        for(int i = 0; i < parameters.PixelsPerLine; i++)
         {
-            hsync = false;
-            try
+            double endIndex = startIndex + BlockSize;
+            ResetFilter(ColorFilters);
+            for(int j = (int)startIndex; j < endIndex; j++)
             {
-                for(int i = 0; i < parameters.PixelsPerLine; i++)
+                for(int k = 0; k < ColorFilters.Length; k++)
                 {
-                    int endIndex = startIndex + BlockSize;
-                    for(int j = startIndex; j < endIndex; j++)
-                    {
-                        for(int k = 0; k < ColorFilters.Length; k++)
-                        {
-                            ColorFilters[k] = ColorFilters[k].AddSample(samples[j]);
-                        }
-                    } 
-                    int maxIndex = GetMaxFilter(ColorFilters);
-                    if(maxIndex == 0)
-                    {   
-                        throw new SyncException();
-                    }
-                    else if(maxIndex <= whiteLevel && maxIndex >= blackLevel)
-                    {
-                        bytes[i] = (byte)(colorStep * (maxIndex - blackLevel));
-                    }
+                    ColorFilters[k] = ColorFilters[k].AddSample(samples[j]);
+                }
+            } 
+            int maxIndex = GetMaxFilter(ColorFilters);
+            if(maxIndex == 0)
+            {   
+                if(hsyncEnable)
+                {
+                    i = -1;
                     startIndex += parameters.StepSize;
+                    colorStartIndex = startIndex;
+                    continue;
                 }
             }
-            catch(SyncException)
+            else if(maxIndex <= whiteLevel && maxIndex >= blackLevel)
             {
-                hsync = true;
-                startIndex += parameters.StepSize;
+                bytes[i] = (byte)(colorStep * (maxIndex - blackLevel));
             }
-        }
-        while(hsync);
+            startIndex += parameters.StepSize;
+        }  
+        startIndex = colorStartIndex + colorSampleCount;
         return bytes;
     }
 

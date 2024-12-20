@@ -47,7 +47,7 @@ public partial class App : Application
         Console.WriteLine("Hello, World!");
 
         SlowScan.WavReader wr = new SlowScan.WavReader();
-        wr.Open("../../../../test.wav");
+        wr.Open("../../../../pd180test.wav");
 
         Machine m = new Machine(wr);
         m.SignalFound += SignalFound;
