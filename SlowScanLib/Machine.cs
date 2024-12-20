@@ -29,7 +29,7 @@ public class Machine
         SampleRate = (int)sampleRate;
         SamplesPerMS = (int)(sampleRate/1000);
         SSTVParameters.SamplesPerMS = SamplesPerMS;   
-        BlockSize = 480;
+        BlockSize = SamplesPerMS * 10; // Block size should be about 10 ms.
 
         ToneFilters = new Goertzel[]
         {
@@ -74,6 +74,10 @@ public class Machine
         while(!foundOptimalLeader)
         {
             int endIndex = startIndex + BlockSize;
+            if(endIndex > samples.Length)
+            {
+                throw new InvalidDataException("No SSTV Found.");
+            }
             for(int i = startIndex; i < endIndex; i++)
             {
                 foreach(FilterType index in Enum.GetValues<FilterType>())
@@ -81,7 +85,8 @@ public class Machine
                     ToneFilters[(int)index] = ToneFilters[(int)index].AddSample(samples[i]);
                 }
             }
-            FilterType currentMax = (FilterType)GetMaxFilter(ToneFilters);
+            double confidence;
+            FilterType currentMax = (FilterType)GetMaxFilter(ToneFilters, out confidence);
             ResetFilter(ToneFilters);
             cv.AddBlock(currentMax, startIndex);
             startIndex += BlockSize;
@@ -93,19 +98,43 @@ public class Machine
 
     }
 
-    private int GetMaxFilter(Goertzel[] filter)
+    private int GetMaxFilter(Goertzel[] filter, out double nextHighestMagnitude)
     {
         int maxType = -1;
+        nextHighestMagnitude = 0;
         double maxMagnitude = 0;
         for(int i = 0; i < filter.Length; i++)
         {
-            if(filter[i].NormResponse > maxMagnitude)
+            if(filter[i].Response > maxMagnitude)
             {
                 maxType = i;
-                maxMagnitude = filter[i].NormResponse;
+                maxMagnitude = filter[i].Response;
             }
         }
 
+        double magnitudeOfLeft;
+        double magnitudeOfRight;
+        if (maxType == -1)
+        {
+            return  maxType;
+        }
+        if(maxType == 0)
+        {
+            magnitudeOfLeft = 0;
+        }
+        else
+        {
+            magnitudeOfLeft = filter[maxType - 1].Response;
+        }
+        if(maxType == filter.Length - 1)
+        {
+            magnitudeOfRight = 0;
+        }
+        else
+        {
+            magnitudeOfRight = filter[maxType + 1].Response;
+        }
+        nextHighestMagnitude = -(magnitudeOfLeft / maxMagnitude) + (magnitudeOfRight / maxMagnitude);
         return maxType;
     }
 
@@ -131,7 +160,7 @@ public class Machine
                 start = start.AddSample(samples[i]);
                 prevTone = prevTone.AddSample(samples[i]);                  
             }
-            if(prevTone.NormResponse > start.NormResponse)
+            if(prevTone.Response > start.Response)
             {
                 // The previous tone is still hanging around.. move up a ms..
                 Console.WriteLine("Lining up..");
@@ -160,7 +189,7 @@ public class Machine
             zero = zero.AddSample(samples[i]);               
         }
         startIndex += toneBlockSize;
-        if (zero.NormResponse > one.NormResponse)
+        if (zero.Response > one.Response)
         {
             return 0;
         }
@@ -194,10 +223,6 @@ public class Machine
             green = ReadLineGoertzel(greenSync, sstv, samples, ref startIndex);
             blue = ReadLineGoertzel(blueSync, sstv, samples, ref startIndex);
             red = ReadLineGoertzel(redSync, sstv, samples, ref startIndex);
-            if(!sstv.RGB)
-            {
-                ReadLineGoertzel(false, sstv, samples, ref startIndex);
-            }
             //startIndex += (int)Math.Ceiling((sstv.SyncLengthMS * SamplesPerMS));
 
         }
@@ -207,7 +232,7 @@ public class Machine
             blue = new byte[sstv.PixelsPerLine];
             green = new byte[sstv.PixelsPerLine];
         }
-        return (red, green, blue);
+        return (green, blue, red);
     }
 
     public Goertzel[] ColorFilters;
@@ -249,56 +274,113 @@ public class Machine
             else if (viscode == 60)
             {
                 // This is Scottie S1.
-                stv = new SSTVParameters(0, 0, 1.5, 256, 256, true, false);
+                stv = new SSTVParameters(138.240, 9, 1.5, 320, 256, true, false);
                 Console.WriteLine("VIS indicates Scottie.");
             }
             else if (viscode == 44 || viscode == 32)
             {
                 // Martin M1!
-                stv = new SSTVParameters(146.432, 4.862, 0.572, 256, 256, true);
+                stv = new SSTVParameters(146.432, 4.862, 0.572, 320, 256, true);
                 Console.WriteLine("VIS Indicates Martin M1.");
             }
             else if (viscode == 40)
             {
-                stv = new SSTVParameters(73.216, 4.862, 0.572, 160, 256, true);
+                stv = new SSTVParameters(73.216, 4.862, 0.572, 320, 256, true);
                 Console.WriteLine("VIS Indicates Martin M2.");
             }
             SignalFound?.Invoke(this, (stv.PixelsPerLine, stv.LinesPerFrame));
 
-            // For Scottie, we need to consume the 1200hz tone at the start of the frame before we proceed.'
-            // TODO: Fix for scottie.
-
             double lineStart = index;
+
+            // For Scottie, we need to consume the 1200hz tone at the start of the frame before we proceed.
+            ConsumeSync(stv, mySamples, ref lineStart);
+
             for(int i = 0; i < stv.LinesPerFrame; i++)
             {
 
-                (byte[], byte[], byte[]) g = ReadLine(stv, mySamples, ref lineStart);
+                (byte[] green, byte[] blue, byte[] red) g = ReadLine(stv, mySamples, ref lineStart);
                 if(!stv.RGB)
                 {
-                    ConvertYCbCrToRGB(g);
+                    // PD modes are in 4:2:0, so there is another luminance ("Y") line.
+                    byte[] y2 = ReadLineGoertzel(false, stv, mySamples, ref lineStart);
+                    var rgb1 = ConvertYCbCrToRGB(g.green, g.blue, g.red);
+                    var rgb2 = ConvertYCbCrToRGB(y2, g.blue, g.red);
+                    LineAvailable?.Invoke(this, (i, rgb1.r, rgb1.g, rgb1.b));
+                    LineAvailable?.Invoke(this, (++i, rgb2.r, rgb2.g, rgb2.b));
                 }
-                LineAvailable?.Invoke(this, (i, g.Item1, g.Item2, g.Item3));
+                else
+                {
+                    LineAvailable?.Invoke(this, (i, g.red, g.green, g.blue));
+                }
             }
         }
         Console.WriteLine("Done");
     }
     
-    private void ConvertYCbCrToRGB((byte[] r, byte[] g, byte[] b) colors)
+    private (byte r, byte g, byte b) ConvertToRGB(byte y, byte u, byte v)
     {
-        int tmp1, tmp2, tmp3;
-        for (int i = 0; i < colors.r.Length; i++)
-        {
-            tmp1 = colors.r[i];
-            tmp2 = colors.g[i];
-            tmp3 = colors.b[i];
-            tmp1 -= 16;
-            tmp2 -= 128;
-            tmp3 -= 128;
-            colors.r[i] = (byte)(1.164 * tmp1 + 0.0000 * tmp2 + 1.5960 * tmp3);
-            colors.g[i] = (byte)(1.164 * tmp1 + -0.392 * tmp2 + -0.813 * tmp3);
-            colors.b[i] = (byte)(1.164 * tmp1 + 2.0170 * tmp2 + 0.0000 * tmp3);
-        }
+        int r, g, b;
+        int tmpy = y - 16;
+        int tmpcb = u - 128;
+        int tmpcr = v - 128;
+        //r = (int)(1.164 * tmpy + 0.0000 * tmpcb + 1.5960 * tmpcr);
+        //g = (int)(1.164 * tmpy + -0.392 * tmpcb + -0.813 * tmpcr);
+        //b = (int)(1.164 * tmpy + 2.0170 * tmpcb + 0.0000 * tmpcr);
+        //r = (int)(1 * tmpy + 0.0000 * tmpcb + 1.139 * tmpcr);
+        //g = (int)(1 * tmpy + -0.395 * tmpcb + -0.581 * tmpcr);
+        //b = (int)(1 * tmpy + 2.0321 * tmpcb + 0.0000 * tmpcr);
+        //r = (int)(1 * tmpy + 0.0000 * tmpcb + 1.402 * tmpcr);
+        //g = (int)(1 * tmpy + -0.344 * tmpcb + -0.714 * tmpcr);
+        //b = (int)(1 * tmpy + 1.772 * tmpcb + 0.0000 * tmpcr);
+        r = (int)(1 * tmpy + 0.0000 * tmpcb + 1.4746 * tmpcr);
+        g = (int)(1 * tmpy + -0.1646 * tmpcb + -0.5714 * tmpcr);
+        b = (int)(1 * tmpy + 1.8814 * tmpcb + 0.0000 * tmpcr);
+        r = Math.Clamp(r, 0, byte.MaxValue);
+        g = Math.Clamp(g, 0, byte.MaxValue);
+        b = Math.Clamp(b, 0, byte.MaxValue);
+        return ((byte)r, (byte)g, (byte)b);
     }
+
+    private (byte[] r, byte[] g, byte[] b) ConvertYCbCrToRGB(byte[] y, byte[] cb, byte[] cr)
+    {
+        byte[] r = new byte[y.Length];
+        byte[] g = new byte[y.Length];
+        byte[] b = new byte[y.Length];
+        for (int i = 0; i < y.Length; i++)
+        {
+            (r[i], g[i], b[i]) = ConvertToRGB(y[i], cb[i], cr[i]);
+        }
+        return (r, g, b);
+    }
+
+    private void ConsumeSync(SSTVParameters parameters, ushort[] samples, ref double startIndex)
+    {
+        for(int i = 0; i < parameters.PixelsPerLine; i++)
+        {
+            double endIndex = startIndex + BlockSize;
+            ResetFilter(ColorFilters);
+            for(int j = (int)startIndex; j < endIndex; j++)
+            {
+                for(int k = 0; k < ColorFilters.Length; k++)
+                {
+                    ColorFilters[k] = ColorFilters[k].AddSample(samples[j]);
+                }
+            } 
+            double confidence;
+            int maxIndex = GetMaxFilter(ColorFilters, out confidence);
+            if(maxIndex == 0)
+            {   
+                i = -1;
+                startIndex += parameters.StepSize;
+                continue;           
+            }
+            else
+            {
+                return;
+            }
+        }  
+    }
+
 
     private byte[] ReadLineGoertzel(bool hsyncEnable, SSTVParameters parameters, ushort[] samples, ref double startIndex)
     {
@@ -307,7 +389,7 @@ public class Machine
         int whiteLevel = 9;
         int colorStep = byte.MaxValue / 9;
         bool hsync = false;
-        int colorSampleCount = SamplesPerMS * (int)Math.Round((parameters.LineLengthMS + parameters.BlackLevelTimeMS), MidpointRounding.AwayFromZero);
+        double colorSampleCount = SamplesPerMS * (parameters.LineLengthMS + parameters.BlackLevelTimeMS);
         double colorStartIndex = startIndex;
         for(int i = 0; i < parameters.PixelsPerLine; i++)
         {
@@ -320,7 +402,8 @@ public class Machine
                     ColorFilters[k] = ColorFilters[k].AddSample(samples[j]);
                 }
             } 
-            int maxIndex = GetMaxFilter(ColorFilters);
+            double confidence;
+            int maxIndex = GetMaxFilter(ColorFilters, out confidence);
             if(maxIndex == 0)
             {   
                 if(hsyncEnable)
@@ -333,7 +416,9 @@ public class Machine
             }
             else if(maxIndex <= whiteLevel && maxIndex >= blackLevel)
             {
-                bytes[i] = (byte)(colorStep * (maxIndex - blackLevel));
+                int stepShift = (int)(colorStep * confidence);
+               
+                bytes[i] = (byte)Math.Clamp(((colorStep * (maxIndex - blackLevel)) + stepShift), 0, byte.MaxValue);
             }
             startIndex += parameters.StepSize;
         }  
